@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: sentiment-trader
+Version: 0.1.0
+Requires-Python: >=3.10
+Requires-Dist: python-dotenv>=1.0.1
+Requires-Dist: pydantic>=2.7.0
+Requires-Dist: pydantic-settings>=2.3.0
+Requires-Dist: requests>=2.32.0
+Requires-Dist: pandas>=2.2.0
+Requires-Dist: numpy>=1.26.0
+Requires-Dist: rich>=13.7.0
+Requires-Dist: loguru>=0.7.2
+Provides-Extra: dev
+Requires-Dist: pytest>=8.2.0; extra == "dev"
+Requires-Dist: ruff>=0.5.0; extra == "dev"

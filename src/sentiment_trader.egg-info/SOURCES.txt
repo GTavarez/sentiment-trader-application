@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/sentiment_trader.egg-info/PKG-INFO
+src/sentiment_trader.egg-info/SOURCES.txt
+src/sentiment_trader.egg-info/dependency_links.txt
+src/sentiment_trader.egg-info/requires.txt
+src/sentiment_trader.egg-info/top_level.txt
+src/trader/__init__.py
+src/trader/config.py
+src/trader/logging_config.py
+src/trader/main.py
