@@ -1,30 +1,42 @@
-from pydantic_settings import BaseSettings
-from pydantic import Field
+from typing import List
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
 
 class Settings(BaseSettings):
-    env: str = "dev"
+    # ---- Broker ----
+    alpaca_api_key: str
+    alpaca_secret_key: str
 
-    broker: str = "alpaca"
+    # ---- Trading ----
     trading_mode: str = "paper"
-    alpaca_api_key: str = Field(..., env="ALPACA_API_KEY")
-    alpaca_secret_key: str = Field(..., env="ALPACA_SECRET_KEY")
-    alpaca_base_url: str = Field(..., env="ALPACA_BASE_URL")
-    news_api_key: str = Field(..., env="NEWS_API_KEY")
+
+    # Multi-symbol support
+    symbol_list: List[str] = ["AAPL", "MSFT", "NVDA"]
 
     max_trades_per_day: int = 5
-    max_position_usd: float = 50.0
-    daily_loss_limit_usd: float = 20.0
+    max_position_usd: float = 500
+    daily_loss_limit_usd: float = 300
+    buy_threshold: float = 0.02
+    sell_threshold: float = -0.02
+    cooldown_minutes: int = 30
 
-    buy_threshold: float = 0.6
-    sell_threshold: float = -0.6
-      # ---- EMAIL ----
+    # ---- News ----
+    news_api_key: str
+
+    # ---- Email ----
     email_from: str
     email_to: str
     email_password: str
     smtp_server: str = "smtp.gmail.com"
     smtp_port: int = 587
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+
+    # ✅ Pydantic v2 config
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_delimiter=",",
+        case_sensitive=False,
+        extra="ignore",
+    )
+    
 
 settings = Settings()

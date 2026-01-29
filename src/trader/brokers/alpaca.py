@@ -9,6 +9,7 @@ from alpaca.trading.requests import GetOrdersRequest
 from requests.exceptions import RequestException
 from loguru import logger
 from datetime import datetime, timezone
+from alpaca.common.exceptions import APIError
 
 class AlpacaBroker:
     def __init__(self, api_key: str, secret_key: str, paper: bool = True):
@@ -29,16 +30,39 @@ class AlpacaBroker:
             raise RuntimeError(f"Alpaca connection failed (positions): {e}")
 
     def get_today_fills(self):
+        """
+        Return ONLY today's filled orders (UTC day).
+        """
         try:
-            today = datetime.now(timezone.utc).date().isoformat()
+            now = datetime.now(timezone.utc)
+            start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
             request = GetOrdersRequest(
                 status="closed",
-                after=today,
                 direction="asc",
             )
-            return self.trading_client.get_orders(request)
+
+            orders = self.trading_client.get_orders(request)
+
+            todays = []
+            for o in orders:
+                filled_at = getattr(o, "filled_at", None)
+                if not filled_at:
+                    continue
+
+                # Normalize timestamp
+                if isinstance(filled_at, str):
+                    ts = datetime.fromisoformat(
+                        filled_at.replace("Z", "+00:00")
+                    ).astimezone(timezone.utc)
+                else:
+                    ts = filled_at.astimezone(timezone.utc)
+
+            return todays
+
         except RequestException as e:
-            raise RuntimeError(f"Alpaca connection failed (orders): {e}")
+            raise RuntimeError(f"Alpaca connection failed (orders): {e}") from e
+
     def get_account(self):
         try:
             return self.trading_client.get_account()
@@ -62,3 +86,28 @@ class AlpacaBroker:
         )
 
         return self.trading_client.submit_order(order)
+    
+    def get_position_qty(self, symbol: str) -> int:
+        try:
+           positions = self.trading_client.get_all_positions()
+           for p in positions:
+               if p.symbol.upper() == symbol.upper():
+                  return int(p.qty)
+           return 0
+        except Exception as e:
+              logger.error(f"Position lookup failed for {symbol}: {e}")
+              return 0
+
+    def cancel_open_orders(self, symbol: str):
+        try:
+           request = GetOrdersRequest(status="open")
+           orders = self.trading_client.get_orders(request)
+
+           for o in orders:
+               if o.symbol == symbol:
+                logger.warning(f"Cancelling open order {o.id} for {symbol}")
+                self.trading_client.cancel_order_by_id(o.id)
+
+        except APIError as e:
+             logger.error(f"Failed to cancel orders for {symbol}: {e}")
+ 

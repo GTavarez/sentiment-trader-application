@@ -7,7 +7,11 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 
-
+from src.trader.config import settings
+from src.trader.backtest.price_loader import fetch_daily_bars_alpaca
+from src.trader.backtest.backtester import run_backtest_with_prices
+from src.trader.backtest.metrics import compute_metrics
+from src.trader.backtest.portfolio_backtester import run_portfolio_backtest
 # =========================
 # DB SETUP (cloud-safe)
 # =========================
@@ -65,10 +69,14 @@ st.title("📈 Sentiment Trader Dashboard")
 # SIDEBAR CONTROLS
 # =========================
 st.sidebar.header("Controls")
-
+auto_refresh = st.sidebar.checkbox("🔄 Auto-refresh", value=True)
 refresh_seconds = st.sidebar.slider("Auto refresh (seconds)", 5, 300, 30)
 selected_date = st.sidebar.date_input("Select date", value=date.today())
 symbol_filter = st.sidebar.text_input("Symbol filter (blank = all)", "").strip().upper()
+st.subheader("Backtest Costs")
+
+slippage_bps = st.slider("Slippage (bps)", 0, 50, 2)          # 2 bps default
+fee_per_trade = st.number_input("Fee per trade ($)", 0.0, 10.0, 0.50, step=0.10)
 
 decision_filter = st.sidebar.multiselect(
     "Signal decision filter",
@@ -113,15 +121,26 @@ trades = load_df(
     (selected_date.isoformat(),),
 )
 
+symbols = sorted(
+    set(
+        load_df("SELECT DISTINCT symbol FROM signals")["symbol"].tolist()
+        + load_df("SELECT DISTINCT symbol FROM trades")["symbol"].tolist()
+    )
+)
+
+symbol_filter = st.sidebar.selectbox(
+    "Symbol",
+    options=["ALL"] + symbols,
+    index=0,
+)
 
 # =========================
 # APPLY FILTERS
 # =========================
-if symbol_filter:
-    if not signals.empty:
-        signals = signals[signals["symbol"].str.upper() == symbol_filter]
-    if not trades.empty:
-        trades = trades[trades["symbol"].str.upper() == symbol_filter]
+if symbol_filter != "ALL":
+    signals = signals[signals["symbol"] == symbol_filter]
+    trades = trades[trades["symbol"] == symbol_filter]
+
 
 if not signals.empty:
     signals = signals[signals["decision"].isin(decision_filter)]
@@ -161,17 +180,21 @@ col3.metric("Gross Notional ($)", f"{gross_notional:,.2f}")
 col4.metric("Daily PnL ($)", f"{daily_pnl:,.2f}")
 
 if daily_pnl <= -300:
-    st.error("🚨 KILL SWITCH ACTIVE — Trading Halted")
+    st.error("🚨 KILL SWITCH ACTIVE — Trading Halted", icon="🚨")
+elif daily_pnl <= -150:
+    st.warning("⚠️ Approaching Daily Loss Limit")
 else:
     st.success("🟢 Trading Enabled")
+
 
 
 # =========================
 # TABS
 # =========================
-tab_signals, tab_trades, tab_charts = st.tabs(
-    ["🧠 Signals", "💰 Trades", "📈 Charts"]
+tab_signals, tab_trades, tab_charts, tab_backtest = st.tabs(
+    ["🧠 Signals", "💰 Trades", "📈 Charts", "🧪 Backtest"]
 )
+
 
 with tab_signals:
     if signals.empty:
@@ -184,40 +207,224 @@ with tab_trades:
         st.info("No trades for this date/filter.")
     else:
         st.dataframe(trades, use_container_width=True)
+with tab_backtest:
+    st.subheader("🧪 Backtest (Real Prices)")
 
-with tab_charts:
-    if not signals.empty:
-        sig = signals.copy()
-        sig["timestamp"] = pd.to_datetime(sig["timestamp"])
+    bt_days = st.slider("Lookback days", 30, 365, 120)
+    bt_trade_size = st.number_input("Trade size ($)", 50, 5000, 500)
+    bt_starting_cash = st.number_input("Starting cash ($)", 1000, 500000, 100000)
 
-        line = alt.Chart(sig).mark_line().encode(
-            x="timestamp:T",
-            y="sentiment:Q",
-            tooltip=["timestamp:T", "sentiment:Q", "decision:N", "symbol:N"],
+    bt_signals = load_df(
+    """
+    SELECT * FROM signals
+    WHERE timestamp >= DATE('now', ?)
+    ORDER BY timestamp ASC
+    """,
+    (f"-{bt_days} day",),
+)
+
+    if bt_signals.empty:
+         st.info("No signals available for backtesting.")
+         st.stop()
+
+    else:
+        symbols = sorted(bt_signals["symbol"].unique().tolist())
+
+        st.caption(f"Fetching daily bars for: {', '.join(symbols)}")
+        hist = (
+            alt.Chart(bt_signals)
+            .mark_bar()
+            .encode(
+                 alt.X("sentiment:Q", bin=alt.Bin(maxbins=50)),
+                  y="count()",
+    )
+)
+
+        st.altair_chart(hist, use_container_width=True)
+
+    prices = fetch_daily_bars_alpaca(
+            api_key=st.secrets["ALPACA_API_KEY"],
+            secret_key=st.secrets["ALPACA_SECRET_KEY"],
+            symbols=symbols,
+            days=int(bt_days),
         )
 
-        chart = line
+    trades_df = pd.DataFrame()
+    equity_df = pd.DataFrame()
+    summary = {}
+        
+    if prices.empty:
+            st.error("No historical prices returned. Check Alpaca market data access.")
+    else:
+            trades_df, equity_df, summary = run_backtest_with_prices(
+                signals=bt_signals,
+                prices=prices,
+                buy_threshold=settings.buy_threshold,
+                sell_threshold=settings.sell_threshold,
+                starting_cash=float(bt_starting_cash),
+                trade_size_usd=float(bt_trade_size),
+                slippage_bps=float(slippage_bps),
+                fee_per_trade=float(fee_per_trade),
+            )
+            st.write("### Summary")
+            st.json(summary)
+            st.write("Equity rows:", len(equity_df))
+            st.write("Trades rows:", len(trades_df))
+    if not trades_df.empty:
+            st.write("Side counts:", trades_df["side"].value_counts())
 
-        if not trades.empty:
-            tr = trades.copy()
-            tr["timestamp"] = pd.to_datetime(tr["timestamp"])
+    metrics = compute_metrics(equity_df)
+    if metrics:
+            st.subheader("📊 Backtest Performance")
 
-            pts = alt.Chart(tr).mark_point(size=120).encode(
-                x="timestamp:T",
-                y=alt.value(0),
-                shape="side:N",
-                tooltip=["timestamp:T", "symbol:N", "side:N", "qty:Q", "price:Q"],
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Sharpe Ratio", metrics["sharpe"])
+            c2.metric("Max Drawdown", f'{metrics["max_drawdown_pct"]}%')
+            c3.metric("Total Return", f'{metrics["total_return_pct"]}%')
+            c4.metric("Trades", summary["trades"])
+
+    if not trades_df.empty:
+            st.write("### Trades")
+            st.dataframe(trades_df, use_container_width=True)
+
+    if not equity_df.empty:
+            st.subheader("📈 Portfolio Equity Curve")
+            ymin = equity_df["equity"].min() * 0.999
+            ymax = equity_df["equity"].max() * 1.001
+
+            st.line_chart(
+            equity_df.set_index("timestamp")["equity"],
+            height=350,
+            use_container_width=True,
             )
 
-            chart = line + pts
-
-        st.altair_chart(chart, use_container_width=True)
+            st.caption(f"Equity range: {equity_df['equity'].min():,.2f} → {equity_df['equity'].max():,.2f}")
     else:
-        st.info("No sentiment data available.")
+            st.info("No portfolio equity generated.")
+
+    if not trades_df.empty:
+            st.subheader("### Backtest Summary")
+    else:
+            st.info("No trades triggered by thresholds.")
+            st.write("Equity DF preview")
+            st.write(equity_df.head())
+            st.write(equity_df.tail())
+            st.write("Equity rows:", len(equity_df))
+            st.write(equity_df.head())
+
+
+# =========================
+# Portfolio Backtest
+# =========================
+equity_df, summary, trades_df, *_ = run_portfolio_backtest(
+    signals=bt_signals,
+    prices=prices,
+    buy_threshold=settings.buy_threshold,
+    sell_threshold=settings.sell_threshold,
+    starting_cash=100_000,
+    trade_risk_pct=0.05,
+)
+if equity_df.empty:
+    st.warning("No portfolio equity generated — check signals & prices.")
+else:
+    st.line_chart(equity_df.set_index("timestamp")["equity"])
+
+result = run_portfolio_backtest(
+    signals=bt_signals,
+    prices=prices,
+    buy_threshold=settings.buy_threshold,
+    sell_threshold=settings.sell_threshold,
+    starting_cash=100_000,
+    trade_risk_pct=0.05,
+)
+
+st.write("Returned type:", type(result))
+st.write("Returned length:", len(result))
+st.write(result)
+
+
+if equity_df.empty:
+    st.warning("No portfolio equity generated — check signals & prices.")
+else:
+    # ---- Equity Curve ----
+    st.subheader("📈 Portfolio Equity Curve")
+    st.line_chart(
+        equity_df.set_index("timestamp")["equity"],
+        height=350,
+    )
+
+       
+
+    st.subheader("📊 Backtest Performance")
+    c1, c2, c3, c4 = st.columns(4)
+
+    c1.metric("Sharpe Ratio", f"{metrics['sharpe']:.2f}")
+    c2.metric("Max Drawdown", f"{metrics['max_drawdown_pct']:.2f}%")
+    c3.metric("Total Return", f"{metrics['total_return_pct']:.2f}%")
+    c4.metric("Trades", metrics["trades"])
+
+    # ---- Summary ----
+    st.subheader("💼 Portfolio Summary")
+    c1, c2 = st.columns(2)
+    c1.metric("Ending Equity", f"${summary['ending_equity']:,.2f}")
+    c2.metric("Net PnL", f"${summary['net_pnl']:,.2f}")
+
+
+if not signals.empty:
+    sig = signals.copy()
+    sig["timestamp"] = pd.to_datetime(sig["timestamp"])
+
+    base = alt.Chart(sig)
+
+    sentiment_line = base.mark_line().encode(
+        x="timestamp:T",
+        y=alt.Y("sentiment:Q", scale=alt.Scale(domain=[-1, 1])),
+        tooltip=["timestamp:T", "sentiment:Q", "decision:N", "symbol:N"],
+    )
+
+    chart = sentiment_line
+
+    if not trades.empty:
+        tr = trades.copy()
+        tr["timestamp"] = pd.to_datetime(tr["timestamp"])
+
+        # Match trade to nearest sentiment timestamp
+        tr = pd.merge_asof(
+            tr.sort_values("timestamp"),
+            sig[["timestamp", "sentiment"]].sort_values("timestamp"),
+            on="timestamp",
+            direction="nearest",
+        )
+
+        trade_points = alt.Chart(tr).mark_point(
+            size=140,
+            filled=True
+        ).encode(
+            x="timestamp:T",
+            y="sentiment:Q",
+            color=alt.Color(
+                "side:N",
+                scale=alt.Scale(domain=["buy", "sell"], range=["green", "red"])
+            ),
+            shape=alt.Shape(
+                "side:N",
+                scale=alt.Scale(domain=["buy", "sell"], range=["triangle-up", "triangle-down"])
+            ),
+            tooltip=["timestamp:T", "side:N", "qty:Q", "price:Q"],
+        )
+
+        chart = sentiment_line + trade_points
+
+    st.altair_chart(chart, use_container_width=True)
+else:
+    st.info("No signals available for charting.")
+
 
 
 # =========================
 # AUTO-REFRESH (LAST LINE)
 # =========================
-time.sleep(refresh_seconds)
-st.rerun()
+if auto_refresh:
+    time.sleep(refresh_seconds)
+    st.rerun()
+
