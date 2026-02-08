@@ -2,17 +2,24 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-from alpaca.data.live import StockDataStream
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestTradeRequest
 from alpaca.trading.requests import GetOrdersRequest
 from requests.exceptions import RequestException
 from loguru import logger
-from datetime import datetime, timezone
 from alpaca.common.exceptions import APIError
+import time
 
 class AlpacaBroker:
-    def __init__(self, api_key: str, secret_key: str, paper: bool = True):
+    def __init__(
+        self,
+        api_key: str,
+        secret_key: str,
+        paper: bool = True,
+        last_price_max_retries: int = 3,
+        last_price_retry_base_s: float = 0.5,
+        last_price_retry_max_s: float = 5.0,
+    ):
         self.trading_client = TradingClient(
             api_key=api_key,
             secret_key=secret_key,
@@ -23,6 +30,9 @@ class AlpacaBroker:
             api_key=api_key,
             secret_key=secret_key,
         )
+        self.last_price_max_retries = max(1, int(last_price_max_retries))
+        self.last_price_retry_base_s = max(0.0, float(last_price_retry_base_s))
+        self.last_price_retry_max_s = max(0.0, float(last_price_retry_max_s))
     def get_positions(self):
         try:
             return self.trading_client.get_all_positions()
@@ -34,9 +44,6 @@ class AlpacaBroker:
         Return ONLY today's filled orders (UTC day).
         """
         try:
-            now = datetime.now(timezone.utc)
-            start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
             request = GetOrdersRequest(
                 status="closed",
                 direction="asc",
@@ -49,14 +56,6 @@ class AlpacaBroker:
                 filled_at = getattr(o, "filled_at", None)
                 if not filled_at:
                     continue
-
-                # Normalize timestamp
-                if isinstance(filled_at, str):
-                    ts = datetime.fromisoformat(
-                        filled_at.replace("Z", "+00:00")
-                    ).astimezone(timezone.utc)
-                else:
-                    ts = filled_at.astimezone(timezone.utc)
 
             return todays
 
@@ -71,9 +70,27 @@ class AlpacaBroker:
 
     def get_last_price(self, symbol: str) -> float:
         request = StockLatestTradeRequest(symbol_or_symbols=symbol)
-        trades = self.data_client.get_stock_latest_trade(request)
-        trade = trades[symbol]
-        return float(trade.price)
+        last_err: Exception | None = None
+        for attempt in range(1, self.last_price_max_retries + 1):
+            try:
+                trades = self.data_client.get_stock_latest_trade(request)
+                trade = trades[symbol]
+                return float(trade.price)
+            except (RequestException, APIError, Exception) as e:
+                last_err = e
+                if attempt >= self.last_price_max_retries:
+                    break
+                sleep_s = min(
+                    self.last_price_retry_base_s * (2 ** (attempt - 1)),
+                    self.last_price_retry_max_s,
+                )
+                logger.warning(
+                    f"Latest price fetch failed for {symbol} "
+                    f"(attempt {attempt}/{self.last_price_max_retries}): {e}"
+                )
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+        raise RuntimeError(f"Failed to fetch latest price for {symbol}: {last_err}")
 
     def place_market_order(self, symbol: str, side: str, qty: int):
         logger.info(f"Placing {side.upper()} order for {qty} {symbol}")
@@ -97,6 +114,17 @@ class AlpacaBroker:
         except Exception as e:
               logger.error(f"Position lookup failed for {symbol}: {e}")
               return 0
+
+    def get_position(self, symbol: str):
+        try:
+            positions = self.trading_client.get_all_positions()
+            for p in positions:
+                if p.symbol.upper() == symbol.upper():
+                    return p
+            return None
+        except Exception as e:
+            logger.error(f"Position lookup failed for {symbol}: {e}")
+            return None
 
     def cancel_open_orders(self, symbol: str):
         try:

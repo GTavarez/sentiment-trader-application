@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional
-
 import pandas as pd
 from loguru import logger
 

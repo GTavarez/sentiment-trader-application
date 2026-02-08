@@ -1,0 +1,22 @@
+{
+  "MSFT": {
+    "reason": "Scale-in cap exceeded: $2006.20 > $1200.00",
+    "timestamp": "2026-02-08T13:45:57.385305"
+  },
+  "NVDA": {
+    "reason": "ELIGIBLE",
+    "timestamp": "2026-02-08T13:39:43.613825"
+  },
+  "AMZN": {
+    "reason": "Eligible",
+    "timestamp": "2026-02-08T13:39:47.238234"
+  },
+  "AAPL": {
+    "reason": "Eligible",
+    "timestamp": "2026-02-08T13:39:38.189477"
+  },
+  "GOOGL": {
+    "reason": "Eligible",
+    "timestamp": "2026-02-08T13:39:44.407265"
+  }
+}
