@@ -36,10 +36,17 @@ class Settings(BaseSettings):
     send_scale_in_block_email: bool = False
     send_daily_health_email: bool = False
     send_startup_email_test: bool = False
+    send_no_closed_trades_email: bool = False
+    no_closed_trades_days_threshold: int = 14
     send_emails: bool = True
     email_max_retries: int = 2
     email_retry_base_s: float = 0.5
     email_retry_max_s: float = 5.0
+    send_fill_timeout_email: bool = False
+    auto_unblock_on_clean_recon: bool = True
+    auto_rebuild_on_recon_mismatch: bool = True
+    order_fill_timeout_s: float = 30.0
+    order_fill_poll_s: float = 1.5
     min_signal_cycles: int = 2
     trend_filter_enabled: bool = True
     trend_sma_days: int = 20
@@ -51,6 +58,25 @@ class Settings(BaseSettings):
     stop_loss_pct: float = 0.02
     trailing_stop_enabled: bool = False
     trailing_stop_pct: float = 0.02
+    symbol_quality_filter_enabled: bool = True
+    symbol_quality_min_closed_trades: int = 5
+    symbol_quality_min_expectancy_usd: float = 0.0
+    symbol_quality_min_win_rate_pct: float = 0.0
+    symbol_quality_lookback_closed_trades: int = 20
+
+    # ---- Market Hours / Orders ----
+    market_hours_only: bool = False
+    market_timezone: str = "America/New_York"
+    market_open_time: str = "09:30"
+    market_close_time: str = "16:00"
+    cancel_stale_open_orders: bool = False
+    stale_order_minutes: int = 60
+
+    # ---- Test Trade ----
+    one_share_test_trade: bool = False
+    test_trade_symbol: str = "AAPL"
+    test_trade_round_trip: bool = True
+    test_trade_once_per_day: bool = True
 
     # ---- Reliability ----
     last_price_max_retries: int = 3

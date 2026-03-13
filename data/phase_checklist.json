@@ -1,4 +1,10 @@
 {
   "phase1_stability_target": "3/1/2026",
-  "phase1_recon_target": "3/1/2026"
+  "phase1_recon_target": "3/1/2026",
+  "phase1_recon": true,
+  "phase1_stability": true,
+  "phase2_metrics": true,
+  "phase2_paper_target": "2026-03-01",
+  "phase1_alerts": true,
+  "phase2_paper": true
 }

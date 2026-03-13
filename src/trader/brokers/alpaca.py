@@ -9,6 +9,7 @@ from requests.exceptions import RequestException
 from loguru import logger
 from alpaca.common.exceptions import APIError
 import time
+from datetime import datetime, timezone
 
 class AlpacaBroker:
     def __init__(
@@ -103,6 +104,36 @@ class AlpacaBroker:
         )
 
         return self.trading_client.submit_order(order)
+
+    def wait_for_fill(self, order_id: str, timeout_s: float = 30.0, poll_s: float = 1.5):
+        """
+        Polls an order until it is filled or a timeout occurs.
+        Returns a dict: {filled: bool, order: object | None}
+        """
+        if not order_id:
+            return {"filled": False, "order": None}
+
+        deadline = time.time() + float(timeout_s)
+        last_order = None
+
+        while time.time() < deadline:
+            try:
+                o = self.trading_client.get_order_by_id(order_id)
+                last_order = o
+                status_raw = getattr(o, "status", "")
+                status = str(status_raw).lower()
+                filled_qty = float(getattr(o, "filled_qty", 0) or 0)
+                is_filled = ("filled" in status) or ("closed" in status)
+                if is_filled and filled_qty > 0:
+                    return {"filled": True, "order": o}
+                if status in {"canceled", "rejected", "expired"}:
+                    return {"filled": False, "order": o}
+            except Exception as e:
+                logger.warning(f"Order fetch failed {order_id}: {e}")
+
+            time.sleep(float(poll_s))
+
+        return {"filled": False, "order": last_order}
     
     def get_position_qty(self, symbol: str) -> int:
         try:
@@ -138,4 +169,39 @@ class AlpacaBroker:
 
         except APIError as e:
              logger.error(f"Failed to cancel orders for {symbol}: {e}")
+
+    def cancel_stale_open_orders(self, max_age_minutes: int = 60) -> int:
+        """
+        Cancel open orders older than max_age_minutes. Returns count canceled.
+        """
+        try:
+            request = GetOrdersRequest(status="open")
+            orders = self.trading_client.get_orders(request)
+        except Exception as e:
+            logger.error(f"Failed to fetch open orders: {e}")
+            return 0
+
+        canceled = 0
+        now_utc = datetime.now(timezone.utc)
+        for o in orders:
+            created_at = getattr(o, "created_at", None)
+            if created_at is None:
+                continue
+            try:
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                age_min = (now_utc - created_at).total_seconds() / 60.0
+            except Exception:
+                continue
+            if age_min >= float(max_age_minutes):
+                try:
+                    self.trading_client.cancel_order_by_id(o.id)
+                    canceled += 1
+                    logger.warning(
+                        f"Cancelled stale order {o.id} "
+                        f"{getattr(o, 'symbol', '')} age={age_min:.1f}m"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to cancel order {o.id}: {e}")
+        return canceled
  

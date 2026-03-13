@@ -1,22 +1,58 @@
 {
   "MSFT": {
-    "reason": "Scale-in cap exceeded: $2006.20 > $1200.00",
-    "timestamp": "2026-02-08T13:45:57.385305"
+    "reason": "ELIGIBLE",
+    "timestamp": "2026-03-02T20:30:28.062232"
   },
   "NVDA": {
-    "reason": "ELIGIBLE",
-    "timestamp": "2026-02-08T13:39:43.613825"
+    "reason": "Symbol quality filter blocked: closed=9 expectancy=-0.09 win_rate=33.3%",
+    "timestamp": "2026-03-13T17:30:31.054356"
   },
   "AMZN": {
-    "reason": "Eligible",
-    "timestamp": "2026-02-08T13:39:47.238234"
+    "reason": "Already in position",
+    "timestamp": "2026-03-13T17:21:00.637929"
   },
   "AAPL": {
-    "reason": "Eligible",
-    "timestamp": "2026-02-08T13:39:38.189477"
+    "reason": "ELIGIBLE",
+    "timestamp": "2026-03-13T15:13:17.515389"
   },
   "GOOGL": {
-    "reason": "Eligible",
-    "timestamp": "2026-02-08T13:39:44.407265"
+    "reason": "Already in position",
+    "timestamp": "2026-03-10T19:31:09.571138"
+  },
+  "META": {
+    "reason": "Already in position",
+    "timestamp": "2026-03-13T16:36:10.034175"
+  },
+  "TSLA": {
+    "reason": "Symbol quality filter blocked: closed=6 expectancy=-19.52 win_rate=33.3%",
+    "timestamp": "2026-03-03T17:00:33.957309"
+  },
+  "AMD": {
+    "reason": "Symbol quality filter blocked: closed=11 expectancy=-12.53 win_rate=18.2%",
+    "timestamp": "2026-03-03T17:00:33.975015"
+  },
+  "NFLX": {
+    "reason": "Already in position",
+    "timestamp": "2026-03-13T17:15:38.177719"
+  },
+  "SPY": {
+    "reason": "Already in position",
+    "timestamp": "2026-03-13T17:15:40.780002"
+  },
+  "AVGO": {
+    "reason": "Symbol quality filter blocked: closed=7 expectancy=-51.76 win_rate=0.0%",
+    "timestamp": "2026-03-03T17:00:33.988935"
+  },
+  "XLF": {
+    "reason": "Already in position",
+    "timestamp": "2026-03-03T19:30:01.535092"
+  },
+  "QQQ": {
+    "reason": "ELIGIBLE",
+    "timestamp": "2026-02-27T15:39:50.390740"
+  },
+  "IWM": {
+    "reason": "Already in position",
+    "timestamp": "2026-03-06T17:30:35.979932"
   }
 }

@@ -37,6 +37,8 @@ READ_ONLY=true
 - `TAKE_PROFIT_PCT` and `STOP_LOSS_PCT` for exits
 - `TRAILING_STOP_ENABLED=true` and `TRAILING_STOP_PCT` for trailing exits
 - `TREND_FILTER_ENABLED=true` and `VOLATILITY_FILTER_ENABLED=true` for filters
+- `SYMBOL_QUALITY_FILTER_ENABLED=true` to auto-skip mature symbols with weak expectancy
+- Tune with `SYMBOL_QUALITY_MIN_CLOSED_TRADES`, `SYMBOL_QUALITY_MIN_EXPECTANCY_USD`, `SYMBOL_QUALITY_MIN_WIN_RATE_PCT`, `SYMBOL_QUALITY_LOOKBACK_CLOSED_TRADES`
 
 ### Reconciliation & Recovery
 - Streamlit includes:

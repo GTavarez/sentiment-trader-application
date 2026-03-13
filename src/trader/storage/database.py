@@ -36,5 +36,20 @@ def init_db():
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS order_attempts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        symbol TEXT,
+        side TEXT,
+        qty INTEGER,
+        price REAL,
+        sentiment REAL,
+        order_id TEXT,
+        status TEXT,
+        reason TEXT
+    )
+    """)
+
     conn.commit()
     conn.close()

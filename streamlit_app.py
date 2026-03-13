@@ -17,6 +17,7 @@ from src.trader.state.halt_state import (
     clear_halt,
 )
 from src.trader.state.symbols import load_symbols, save_symbols
+from src.trader.state.auto_heal import sync_db_positions_with_broker
 
 
 
@@ -45,27 +46,22 @@ def load_block_reasons():
 
 def rebuild_trades_from_broker(broker: AlpacaBroker) -> list[tuple[str, int]]:
     positions = broker.get_positions()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM trades")
-    now = datetime.utcnow().isoformat()
+    payload = []
     rebuilt = []
     for p in positions:
         sym = getattr(p, "symbol", None)
         qty = int(getattr(p, "qty", 0))
         price = float(getattr(p, "avg_entry_price", 0.0) or 0.0)
-        if not sym or qty <= 0:
+        if not sym:
             continue
-        cur.execute(
-            """
-            INSERT INTO trades (timestamp, symbol, side, qty, price, sentiment, order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (now, sym, "buy", qty, price, 0.0, "REBUILD_FROM_BROKER"),
-        )
-        rebuilt.append((sym, qty))
-    conn.commit()
-    conn.close()
+        payload.append({"symbol": sym, "qty": qty, "avg_entry_price": price})
+        if qty > 0:
+            rebuilt.append((sym, qty))
+
+    sync_db_positions_with_broker(
+        reason="STREAMLIT_REBUILD_FROM_BROKER",
+        positions=payload,
+    )
     return rebuilt
 
 
@@ -483,6 +479,30 @@ trades_today = load_df(
     """,
     (start_utc,),
 )
+
+# ----------------------------
+# Daily Summary
+# ----------------------------
+st.subheader("🧭 Daily Summary")
+if trades_today.empty:
+    st.info("No trades recorded today.")
+else:
+    td = trades_today.copy()
+    td["side"] = td["side"].astype(str).str.lower()
+    td["notional"] = td["qty"].astype(float) * td["price"].astype(float)
+    total_trades = len(td)
+    buys = int((td["side"] == "buy").sum())
+    sells = int((td["side"] == "sell").sum())
+    net_flow = float(
+        td.apply(lambda r: r["notional"] * (-1 if r["side"] == "buy" else 1), axis=1).sum()
+    )
+    last_ts = td["timestamp"].iloc[0]
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Trades", total_trades)
+    c2.metric("Buys / Sells", f"{buys} / {sells}")
+    c3.metric("Net Flow ($)", f"{net_flow:,.2f}")
+    c4.metric("Last Trade (UTC)", str(last_ts))
+
 if trades_today.empty:
     st.info("No trades recorded today.")
 else:
@@ -528,6 +548,25 @@ c2.metric("Win Rate (%)", f"{win_rate:.1f}")
 c3.metric("Wins", f"{wins}")
 c4.metric("Avg Win ($)", f"{avg_win:,.2f}")
 c5.metric("Avg Loss ($)", f"{avg_loss:,.2f}")
+
+# ----------------------------
+# Phase 2 Progress
+# ----------------------------
+st.subheader("📍 Phase 2 Progress")
+check_state = load_phase_checklist()
+phase2_target = check_state.get("phase2_paper_target", "2026-03-01")
+target_closed_trades = 40
+avg_loss_abs = abs(avg_loss) if avg_loss != 0 else 0.0
+win_loss_ratio = (avg_win / avg_loss_abs) if avg_loss_abs > 0 else 0.0
+
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Target Date", str(phase2_target))
+c2.metric("Closed Trades", f"{total_closed}")
+c3.metric("Win Rate (%)", f"{win_rate:.1f}")
+c4.metric("Avg Win/Loss", f"{win_loss_ratio:.2f}")
+
+progress = min(1.0, total_closed / target_closed_trades) if target_closed_trades > 0 else 0.0
+st.progress(progress, text=f"Closed trades: {total_closed}/{target_closed_trades}")
 
 # Drawdown stats (realized)
 if pnl_curve.empty:
@@ -902,7 +941,7 @@ else:
 
     st.subheader("🛠️ Rebuild DB From Broker (admin)")
     st.warning(
-        "This will DELETE all trades in the DB and rebuild positions from current broker holdings."
+        "This will sync DB open-position quantities to current broker holdings without deleting trade history."
     )
     confirm_rebuild = st.checkbox("I understand — rebuild the DB trades", key="confirm_rebuild_db")
     if st.button("🔁 Rebuild Trades From Broker", key="rebuild_trades_btn", disabled=not confirm_rebuild):
@@ -918,16 +957,16 @@ else:
         st.subheader("🧹 Live DB Cleanup Suggestion")
         st.info(
             "Live account has no positions, but the DB shows paper trades. "
-            "You can clear and rebuild the DB from live broker positions (empty)."
+            "You can sync DB position state from live broker positions (empty)."
         )
         confirm_live_clean = st.checkbox(
-            "I understand — clear paper DB trades for live account",
+            "I understand — sync DB to live broker positions",
             key="confirm_live_clean",
         )
         if st.button(
-            "✅ Clear Paper DB (Live)",
+            "✅ Sync DB With Live Broker",
             key="clear_paper_db_live_btn",
             disabled=not confirm_live_clean,
         ):
             rebuilt = rebuild_trades_from_broker(broker)
-            st.success("DB cleared from live broker (empty).")
+            st.success("DB synced from live broker (empty).")

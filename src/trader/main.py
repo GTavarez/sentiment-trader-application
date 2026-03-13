@@ -10,7 +10,8 @@ if os.name == "nt":
 from rich import print
 from loguru import logger
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 import time
 
 from src.trader.config import settings
@@ -22,8 +23,8 @@ from src.trader.sentiment.finbert_model import FinBertSentimentModel
 from src.trader.sentiment.news_fetcher import NewsFetcher
 from src.trader.strategy.sentiment_strategy import SentimentStrategy
 
-from src.trader.storage.database import init_db
-from src.trader.storage.trade_logger import log_trade
+from src.trader.storage.database import init_db, get_connection
+from src.trader.storage.trade_logger import log_trade, log_order_attempt
 from src.trader.Notifications.emailer import send_email
 from src.trader.state.streaks import load_streaks, save_streaks
 from src.trader.state.cooldowns import load_cooldowns, save_cooldowns
@@ -37,9 +38,16 @@ from src.trader.state.halt_state import (
     clear_halt,
 )
 from src.trader.state.recovery import can_auto_heal, auto_heal_action
-from src.trader.state.auto_heal import clear_db_positions, add_broker_positions_to_db
+from src.trader.state.auto_heal import (
+    clear_db_positions,
+    add_broker_positions_to_db,
+    sync_db_positions_with_broker,
+)
 from src.trader.state.symbols import load_symbols
 from src.trader.backtest.price_loader import fetch_daily_bars_alpaca
+
+
+fill_timeout_alerted: set[str] = set()
 
 
 
@@ -82,6 +90,85 @@ def get_last_price_safe(
         logger.error(f"Price fetch failed for {symbol}{ctx}: {e}")
         save_block_reason(symbol, f"Price fetch failed{ctx}: {e}")
         return None
+
+
+def wait_for_order_fill(
+    broker: AlpacaBroker,
+    order,
+    symbol: str,
+    side: str,
+    fallback_price: float | None,
+) -> dict | None:
+    order_id = str(getattr(order, "id", "")) if order is not None else ""
+    try:
+        result = broker.wait_for_fill(
+            order_id=order_id,
+            timeout_s=settings.order_fill_timeout_s,
+            poll_s=settings.order_fill_poll_s,
+        )
+    except Exception as e:
+        logger.warning(f"Order fill wait failed {symbol} {side} ({order_id}): {e}")
+        return None
+
+    if not result or not result.get("filled"):
+        status = "unknown"
+        o = result.get("order") if result else None
+        if o is not None:
+            status = str(getattr(o, "status", "unknown"))
+        logger.warning(
+            f"Order not filled yet; skipping log {symbol} {side} ({order_id}) status={status}"
+        )
+        try:
+            log_order_attempt(
+                symbol=symbol,
+                side=side,
+                qty=0,
+                price=fallback_price,
+                sentiment=None,
+                order_id=order_id or "UNKNOWN",
+                status="fill_timeout",
+                reason=f"status={status}",
+            )
+        except Exception:
+            pass
+        if (
+            settings.send_emails
+            and settings.send_fill_timeout_email
+            and order_id
+            and order_id not in fill_timeout_alerted
+        ):
+            fill_timeout_alerted.add(order_id)
+            try:
+                send_email(
+                    subject=f"⚠️ Order Fill Timeout: {symbol} {side.upper()}",
+                    body=(
+                        f"Symbol: {symbol}\n"
+                        f"Side: {side.upper()}\n"
+                        f"Order ID: {order_id}\n"
+                        f"Status: {status}\n"
+                        f"Timeout: {settings.order_fill_timeout_s}s\n"
+                        f"Poll: {settings.order_fill_poll_s}s\n"
+                        f"Fallback price: {fallback_price}\n"
+                    ),
+                    settings=settings,
+                )
+            except Exception as e:
+                logger.error(f"Fill-timeout email failed: {e}")
+        return None
+
+    o = result.get("order")
+    filled_qty = float(getattr(o, "filled_qty", 0) or 0)
+    filled_price = float(getattr(o, "filled_avg_price", 0) or 0)
+    if filled_price <= 0 and fallback_price is not None:
+        filled_price = float(fallback_price)
+    if filled_qty <= 0:
+        return None
+
+    return {
+        "order_id": order_id,
+        "qty": int(filled_qty),
+        "price": float(filled_price),
+    }
 
 
 def build_price_indicators(symbols: list[str], api_key: str, secret_key: str) -> dict:
@@ -131,6 +218,294 @@ def build_price_indicators(symbols: list[str], api_key: str, secret_key: str) ->
     return indicators
 
 
+def compute_symbol_quality_metrics(lookback_closed_trades: int = 20) -> dict[str, dict]:
+    """
+    Compute per-symbol realized-trade quality metrics from DB trades using FIFO matching.
+    """
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT timestamp, symbol, side, qty, price
+            FROM trades
+            ORDER BY timestamp ASC
+            """
+        ).fetchall()
+    except Exception as e:
+        logger.warning(f"Symbol quality metrics unavailable: {e}")
+        conn.close()
+        return {}
+    conn.close()
+
+    fifo: dict[str, list[list[float]]] = {}
+    realized_by_symbol: dict[str, list[float]] = {}
+
+    for _, symbol, side, qty, price in rows:
+        sym = str(symbol).upper()
+        side_l = str(side).lower()
+        trade_qty = int(qty)
+        trade_px = float(price)
+
+        if sym not in fifo:
+            fifo[sym] = []
+        if sym not in realized_by_symbol:
+            realized_by_symbol[sym] = []
+
+        if side_l == "buy":
+            fifo[sym].append([trade_qty, trade_px])
+        elif side_l == "sell":
+            remaining = trade_qty
+            while remaining > 0 and fifo[sym]:
+                lot_qty, lot_px = fifo[sym][0]
+                matched = min(remaining, int(lot_qty))
+                pnl = (trade_px - float(lot_px)) * matched
+                realized_by_symbol[sym].append(float(pnl))
+                remaining -= matched
+                lot_qty = int(lot_qty) - matched
+                if lot_qty <= 0:
+                    fifo[sym].pop(0)
+                else:
+                    fifo[sym][0][0] = lot_qty
+
+    if lookback_closed_trades > 0:
+        for sym in list(realized_by_symbol.keys()):
+            realized_by_symbol[sym] = realized_by_symbol[sym][-lookback_closed_trades:]
+
+    metrics: dict[str, dict] = {}
+    for sym, pnls in realized_by_symbol.items():
+        nonzero = [p for p in pnls if p != 0]
+        if not nonzero:
+            continue
+        wins = [p for p in nonzero if p > 0]
+        losses = [p for p in nonzero if p < 0]
+        closed = len(nonzero)
+        win_rate = (len(wins) / closed * 100.0) if closed > 0 else 0.0
+        avg_win = (sum(wins) / len(wins)) if wins else 0.0
+        avg_loss = (sum(losses) / len(losses)) if losses else 0.0
+        expectancy = sum(nonzero) / closed if closed > 0 else 0.0
+        metrics[sym] = {
+            "closed_trades": int(closed),
+            "win_rate_pct": float(win_rate),
+            "avg_win": float(avg_win),
+            "avg_loss": float(avg_loss),
+            "expectancy": float(expectancy),
+            "total_pnl": float(sum(nonzero)),
+        }
+    return metrics
+
+
+def filter_symbols_by_quality(
+    symbols: list[str],
+    protected_symbols: set[str] | None = None,
+) -> list[str]:
+    if not settings.symbol_quality_filter_enabled:
+        return [s.upper() for s in symbols]
+
+    protected = {s.upper() for s in (protected_symbols or set())}
+    min_closed = max(1, int(settings.symbol_quality_min_closed_trades))
+    min_expectancy = float(settings.symbol_quality_min_expectancy_usd)
+    min_win_rate = float(settings.symbol_quality_min_win_rate_pct)
+    lookback_closed = max(0, int(settings.symbol_quality_lookback_closed_trades))
+
+    metrics = compute_symbol_quality_metrics(lookback_closed_trades=lookback_closed)
+    kept: list[str] = []
+
+    for symbol in symbols:
+        sym = str(symbol).upper()
+        m = metrics.get(sym)
+
+        # Never filter out symbols with an open position; exits still need to run.
+        if sym in protected:
+            kept.append(sym)
+            continue
+
+        # Keep symbols with insufficient realized history; gate only when sample is mature.
+        if not m or int(m["closed_trades"]) < min_closed:
+            kept.append(sym)
+            continue
+
+        if float(m["expectancy"]) < min_expectancy or float(m["win_rate_pct"]) < min_win_rate:
+            reason = (
+                f"Symbol quality filter blocked: closed={m['closed_trades']} "
+                f"expectancy={m['expectancy']:.2f} win_rate={m['win_rate_pct']:.1f}%"
+            )
+            logger.info(f"{sym} | {reason}")
+            save_block_reason(sym, reason)
+            continue
+
+        kept.append(sym)
+
+    if not kept:
+        logger.warning("Symbol quality filter removed all symbols; using configured list.")
+        print("[yellow]Symbol quality filter removed all symbols; using configured list.[/yellow]")
+        return [s.upper() for s in symbols]
+
+    if len(kept) < len(symbols):
+        print(
+            f"[cyan]Symbol quality filter active:[/cyan] "
+            f"trading {len(kept)}/{len(symbols)} symbols"
+        )
+
+    return kept
+
+
+def get_last_closed_trade_timestamp() -> datetime | None:
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT timestamp
+            FROM trades
+            WHERE LOWER(side) = 'sell'
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"Failed to fetch last closed trade: {e}")
+        return None
+
+    if not row or not row[0]:
+        return None
+
+    try:
+        ts = datetime.fromisoformat(row[0])
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+    except Exception:
+        return None
+
+
+def is_market_open_now() -> bool:
+    try:
+        tz = ZoneInfo(settings.market_timezone)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+
+    now = datetime.now(tz)
+    if now.weekday() >= 5:
+        return False
+
+    try:
+        open_h, open_m = [int(x) for x in settings.market_open_time.split(":")]
+        close_h, close_m = [int(x) for x in settings.market_close_time.split(":")]
+    except Exception:
+        open_h, open_m = 9, 30
+        close_h, close_m = 16, 0
+
+    open_t = now.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+    close_t = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+    return open_t <= now <= close_t
+
+
+def should_run_test_trade() -> bool:
+    if not settings.one_share_test_trade:
+        return False
+    if not settings.test_trade_once_per_day:
+        return True
+
+    try:
+        tz = ZoneInfo(settings.market_timezone)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+
+    today = datetime.now(tz).date().isoformat()
+    marker = Path("data/test_trade_last.txt")
+    try:
+        if marker.exists():
+            last = marker.read_text().strip()
+            if last == today:
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def mark_test_trade_ran() -> None:
+    try:
+        tz = ZoneInfo(settings.market_timezone)
+    except Exception:
+        tz = ZoneInfo("America/New_York")
+    today = datetime.now(tz).date().isoformat()
+    Path("data").mkdir(parents=True, exist_ok=True)
+    Path("data/test_trade_last.txt").write_text(today + "\n")
+
+
+def broker_fallback_sell(
+    broker: AlpacaBroker,
+    symbol: str,
+    pre_qty: int,
+    sentiment: float | None,
+    reason: str,
+    price_hint: float | None,
+) -> int:
+    """
+    If an order was placed but no fill confirmation arrived, check broker positions.
+    If qty dropped, log a SELL based on broker truth.
+    Returns sold qty (0 if none).
+    """
+    try:
+        post_qty = broker.get_position_qty(symbol)
+    except Exception:
+        return 0
+
+    sold_qty = max(int(pre_qty) - int(post_qty), 0)
+    if sold_qty <= 0:
+        return 0
+
+    price = price_hint
+    if price is None:
+        price = get_last_price_safe(broker, symbol, f"broker_fallback_{reason}")
+
+    try:
+        log_trade(
+            symbol=symbol,
+            side="sell",
+            qty=int(sold_qty),
+            price=float(price or 0.0),
+            sentiment=float(sentiment or 0.0),
+            order_id=f"BROKER_FALLBACK_{reason}",
+        )
+    except Exception:
+        pass
+
+    try:
+        log_order_attempt(
+            symbol=symbol,
+            side="sell",
+            qty=int(sold_qty),
+            price=price,
+            sentiment=sentiment,
+            order_id=f"BROKER_FALLBACK_{reason}",
+            status="broker_fallback",
+            reason=reason,
+        )
+    except Exception:
+        pass
+
+    try:
+        send_email(
+            subject=f"📉 Trade Executed (Broker Truth): {symbol} SELL",
+            body=(
+                f"Symbol: {symbol}\n"
+                f"Side: SELL\n"
+                f"Qty: {int(sold_qty)}\n"
+                f"Price: ${float(price or 0.0):.2f}\n"
+                f"Reason: {reason}\n"
+                "Note: Fill confirmation missing; logged using broker position change.\n"
+            ),
+            settings=settings,
+        )
+    except Exception:
+        pass
+
+    return sold_qty
+
+
 def main():
     # ---- quick visibility of config thresholds ----
     print("THRESHOLDS:", settings.buy_threshold, settings.sell_threshold)
@@ -141,6 +516,41 @@ def main():
 
     print("[bold cyan]Booting Sentiment Trader[/bold cyan]")
     init_db()
+
+    # ----- STALE CLOSED-TRADES WARNING -----
+    if settings.send_emails and settings.send_no_closed_trades_email:
+        last_closed = get_last_closed_trade_timestamp()
+        now_utc = datetime.now(timezone.utc)
+        if last_closed is None:
+            try:
+                send_email(
+                    subject="⚠️ No Closed Trades Found",
+                    body=(
+                        "No SELL trades found in the database yet.\n"
+                        "This can happen if orders never fill, the bot halts early, "
+                        "or logging is skipped.\n"
+                        f"Time (UTC): {now_utc.isoformat()}\n"
+                    ),
+                    settings=settings,
+                )
+            except Exception as e:
+                logger.error(f"No-closed-trades email failed: {e}")
+        else:
+            days_since = (now_utc - last_closed).total_seconds() / 86400.0
+            if days_since >= float(settings.no_closed_trades_days_threshold):
+                try:
+                    send_email(
+                        subject="⚠️ Stale Closed Trades",
+                        body=(
+                            f"Last SELL trade: {last_closed.isoformat()}\n"
+                            f"Days since last close: {days_since:.2f}\n"
+                            f"Threshold: {settings.no_closed_trades_days_threshold} days\n"
+                            f"Time (UTC): {now_utc.isoformat()}\n"
+                        ),
+                        settings=settings,
+                    )
+                except Exception as e:
+                    logger.error(f"Stale-closed-trades email failed: {e}")
 
     # ----- MODE -----
     trading_mode = settings.trading_mode.lower()
@@ -211,6 +621,15 @@ def main():
             logger.error(e)
         return
 
+    # ----- CANCEL STALE OPEN ORDERS -----
+    if settings.cancel_stale_open_orders:
+        try:
+            canceled = broker.cancel_stale_open_orders(settings.stale_order_minutes)
+            if canceled:
+                logger.warning(f"Cancelled {canceled} stale open orders.")
+        except Exception as e:
+            logger.warning(f"Failed to cancel stale orders: {e}")
+
     # ----- STARTUP EMAIL TEST -----
     if settings.send_emails and settings.send_startup_email_test:
         try:
@@ -238,38 +657,16 @@ def main():
         recon_summary = {"error": str(e)}
     # If reconciliation failed, attempt safe auto-heal (paper only).
     if not recon_ok:
-        if can_auto_heal(
-            trading_mode=settings.trading_mode,
-            summary=recon_summary,
+        if (
+            settings.trading_mode.lower() != "live"
+            and settings.auto_rebuild_on_recon_mismatch
         ):
-            decision = auto_heal_action(recon_summary)
-
-            if decision["action"] == "CLEAR_DB_POSITIONS":
-                ghost_symbols = [
-                    r.get("symbol")
-                    for r in recon.get("rows", [])
-                    if r.get("status") == "GHOST_DB_POSITION"
-                ]
-                ghost_symbols = [s for s in ghost_symbols if s]
-                clear_db_positions(reason=decision["reason"], symbols=ghost_symbols)
-                logger.warning("AUTO-HEAL APPLIED", decision)
-                print("🩹 AUTO-HEAL APPLIED — restart bot to continue")
-                return
-            if decision["action"] == "REBUILD_DB_FROM_BROKER":
+            try:
                 broker_positions = broker.get_positions()
-                broker_map = {
-                    p.symbol.upper(): p for p in broker_positions if hasattr(p, "symbol")
-                }
-                ghost_symbols = [
-                    r.get("symbol")
-                    for r in recon.get("rows", [])
-                    if r.get("status") == "GHOST_BROKER_POSITION"
-                ]
-                ghost_symbols = [s for s in ghost_symbols if s]
                 positions_payload = []
-                for sym in ghost_symbols:
-                    p = broker_map.get(sym.upper())
-                    if not p:
+                for p in broker_positions:
+                    sym = getattr(p, "symbol", None)
+                    if not sym:
                         continue
                     positions_payload.append(
                         {
@@ -280,61 +677,130 @@ def main():
                             ),
                         }
                     )
-                add_broker_positions_to_db(
-                    reason=decision["reason"],
+                sync_db_positions_with_broker(
+                    reason="AUTO_REBUILD_ON_RECON_MISMATCH",
                     positions=positions_payload,
                 )
-                logger.warning("AUTO-HEAL APPLIED", decision)
-                print("🩹 AUTO-HEAL APPLIED — restart bot to continue")
-                return
-            if decision["action"] == "SYNC_DB_WITH_BROKER":
-                ghost_db_symbols = [
-                    r.get("symbol")
-                    for r in recon.get("rows", [])
-                    if r.get("status") == "GHOST_DB_POSITION"
-                ]
-                ghost_db_symbols = [s for s in ghost_db_symbols if s]
-                if ghost_db_symbols:
-                    clear_db_positions(reason=decision["reason"], symbols=ghost_db_symbols)
+                logger.warning("AUTO-REBUILD APPLIED — rechecking reconciliation.")
+                print("🩹 AUTO-REBUILD APPLIED — rechecking reconciliation.")
+                recon = reconcile_positions(broker)
+                recon_ok = bool(recon.get("ok", False))
+                recon_summary = dict(recon.get("summary", {}))
+            except Exception as e:
+                logger.error(f"AUTO-REBUILD FAILED: {e}")
+                print(f"[red]AUTO-REBUILD FAILED[/red]: {e}")
 
-                broker_positions = broker.get_positions()
-                broker_map = {
-                    p.symbol.upper(): p for p in broker_positions if hasattr(p, "symbol")
-                }
-                ghost_broker_symbols = [
-                    r.get("symbol")
-                    for r in recon.get("rows", [])
-                    if r.get("status") == "GHOST_BROKER_POSITION"
-                ]
-                ghost_broker_symbols = [s for s in ghost_broker_symbols if s]
-                positions_payload = []
-                for sym in ghost_broker_symbols:
-                    p = broker_map.get(sym.upper())
-                    if not p:
-                        continue
-                    positions_payload.append(
-                        {
-                            "symbol": sym,
-                            "qty": int(getattr(p, "qty", 0)),
-                            "avg_entry_price": float(
-                                getattr(p, "avg_entry_price", 0.0) or 0.0
-                            ),
-                        }
-                    )
-                if positions_payload:
+        if recon_ok:
+            logger.warning("AUTO-REBUILD SUCCESS — reconciliation OK, continuing.")
+        else:
+            if can_auto_heal(
+                trading_mode=settings.trading_mode,
+                summary=recon_summary,
+            ):
+                decision = auto_heal_action(recon_summary)
+
+                if decision["action"] == "CLEAR_DB_POSITIONS":
+                    ghost_symbols = [
+                        r.get("symbol")
+                        for r in recon.get("rows", [])
+                        if r.get("status") == "GHOST_DB_POSITION"
+                    ]
+                    ghost_symbols = [s for s in ghost_symbols if s]
+                    clear_db_positions(reason=decision["reason"], symbols=ghost_symbols)
+                    logger.warning("AUTO-HEAL APPLIED", decision)
+                    print("🩹 AUTO-HEAL APPLIED — restart bot to continue")
+                    return
+                if decision["action"] == "REBUILD_DB_FROM_BROKER":
+                    broker_positions = broker.get_positions()
+                    broker_map = {
+                        p.symbol.upper(): p for p in broker_positions if hasattr(p, "symbol")
+                    }
+                    ghost_symbols = [
+                        r.get("symbol")
+                        for r in recon.get("rows", [])
+                        if r.get("status") == "GHOST_BROKER_POSITION"
+                    ]
+                    ghost_symbols = [s for s in ghost_symbols if s]
+                    positions_payload = []
+                    for sym in ghost_symbols:
+                        p = broker_map.get(sym.upper())
+                        if not p:
+                            continue
+                        positions_payload.append(
+                            {
+                                "symbol": sym,
+                                "qty": int(getattr(p, "qty", 0)),
+                                "avg_entry_price": float(
+                                    getattr(p, "avg_entry_price", 0.0) or 0.0
+                                ),
+                            }
+                        )
                     add_broker_positions_to_db(
                         reason=decision["reason"],
                         positions=positions_payload,
                     )
+                    logger.warning("AUTO-HEAL APPLIED", decision)
+                    print("🩹 AUTO-HEAL APPLIED — restart bot to continue")
+                    return
+                if decision["action"] == "SYNC_DB_WITH_BROKER":
+                    ghost_db_symbols = [
+                        r.get("symbol")
+                        for r in recon.get("rows", [])
+                        if r.get("status") == "GHOST_DB_POSITION"
+                    ]
+                    ghost_db_symbols = [s for s in ghost_db_symbols if s]
+                    if ghost_db_symbols:
+                        clear_db_positions(reason=decision["reason"], symbols=ghost_db_symbols)
 
-                logger.warning("AUTO-HEAL APPLIED", decision)
-                print("🩹 AUTO-HEAL APPLIED — restart bot to continue")
-                return
-        # Any mismatch should halt until operator unblocks.
-        write_halt(reason="RECON_MISMATCH", details=recon_summary)
-        print("🚨 RECONCILIATION MISMATCH — TRADING HALTED")
-        logger.error(f"RECONCILIATION MISMATCH — halted: {recon_summary}")
-        return
+                    broker_positions = broker.get_positions()
+                    broker_map = {
+                        p.symbol.upper(): p for p in broker_positions if hasattr(p, "symbol")
+                    }
+                    ghost_broker_symbols = [
+                        r.get("symbol")
+                        for r in recon.get("rows", [])
+                        if r.get("status") == "GHOST_BROKER_POSITION"
+                    ]
+                    ghost_broker_symbols = [s for s in ghost_broker_symbols if s]
+                    target_symbols = sorted(
+                        set([s.upper() for s in ghost_db_symbols + ghost_broker_symbols])
+                    )
+                    positions_payload = []
+                    for sym in target_symbols:
+                        p = broker_map.get(sym.upper())
+                        if p:
+                            positions_payload.append(
+                                {
+                                    "symbol": sym,
+                                    "qty": int(getattr(p, "qty", 0)),
+                                    "avg_entry_price": float(
+                                        getattr(p, "avg_entry_price", 0.0) or 0.0
+                                    ),
+                                }
+                            )
+                        else:
+                            positions_payload.append(
+                                {
+                                    "symbol": sym,
+                                    "qty": 0,
+                                    "avg_entry_price": 0.0,
+                                }
+                            )
+                    if target_symbols:
+                        sync_db_positions_with_broker(
+                            reason=decision["reason"],
+                            positions=positions_payload,
+                            symbols=target_symbols,
+                        )
+
+                    logger.warning("AUTO-HEAL APPLIED", decision)
+                    print("🩹 AUTO-HEAL APPLIED — restart bot to continue")
+                    return
+            # Any mismatch should halt until operator unblocks.
+            write_halt(reason="RECON_MISMATCH", details=recon_summary)
+            print("🚨 RECONCILIATION MISMATCH — TRADING HALTED")
+            logger.error(f"RECONCILIATION MISMATCH — halted: {recon_summary}")
+            return
     # Compute the fingerprint for current recon result
     current_fp = compute_fingerprint(recon_summary)
     existing_halt = load_halt_state()
@@ -347,6 +813,15 @@ def main():
             # Clear halt state so it does not linger after a successful unblock
             clear_halt()
             logger.info("CONTROLLED RECOVERY — halt state cleared.")
+        elif (
+            settings.trading_mode.lower() != "live"
+            and settings.auto_unblock_on_clean_recon
+            and recon_ok
+        ):
+            print("✅ AUTO-UNBLOCK — reconciliation is clean (paper mode).")
+            logger.info("CONTROLLED RECOVERY — auto-unblock (paper mode, clean recon).")
+            clear_halt()
+            logger.info("CONTROLLED RECOVERY — halt state cleared (auto).")
         else:
             print("🚨 TRADING STILL HALTED — waiting for operator UNBLOCK in Streamlit")
             print(f"Current fingerprint: {current_fp}")
@@ -363,12 +838,104 @@ def main():
             print(p.symbol, p.qty)
     except Exception as e:
         logger.warning(f"Could not fetch positions at start: {e}")
+        positions = []
 
     # ----- BUYING POWER CHECK (LIVE ONLY) -----
     if not paper and buying_power <= 0:
         print("[bold red]NO BUYING POWER — SKIPPING TRADES[/bold red]")
         logger.error("NO BUYING POWER — fund live account before trading")
         return
+
+    # ----- MARKET HOURS GUARD -----
+    if settings.market_hours_only and not is_market_open_now():
+        print("[yellow]Market closed — skipping trading actions[/yellow]")
+        logger.warning("Market closed — skipping trading actions")
+        return
+
+    # ----- ONE-SHARE TEST TRADE (PAPER ONLY) -----
+    if paper and not read_only and should_run_test_trade():
+        test_symbol = settings.test_trade_symbol.upper().strip() or "AAPL"
+        if not settings.market_hours_only or is_market_open_now():
+            try:
+                print(f"[yellow]TEST TRADE → BUY 1 {test_symbol}[/yellow]")
+                order = broker.place_market_order(test_symbol, "buy", 1)
+                try:
+                    log_order_attempt(
+                        symbol=test_symbol,
+                        side="buy",
+                        qty=1,
+                        price=None,
+                        sentiment=None,
+                        order_id=str(getattr(order, "id", "TEST_BUY")),
+                        status="submitted",
+                        reason="test_trade_buy",
+                    )
+                except Exception:
+                    pass
+
+                fill = wait_for_order_fill(
+                    broker=broker,
+                    order=order,
+                    symbol=test_symbol,
+                    side="buy",
+                    fallback_price=None,
+                )
+                if fill:
+                    log_trade(
+                        symbol=test_symbol,
+                        side="buy",
+                        qty=int(fill["qty"]),
+                        price=float(fill["price"]),
+                        sentiment=0.0,
+                        order_id=str(fill["order_id"] or "TEST_BUY"),
+                    )
+
+                    if settings.test_trade_round_trip:
+                        print(f"[yellow]TEST TRADE → SELL 1 {test_symbol}[/yellow]")
+                        order2 = broker.place_market_order(test_symbol, "sell", 1)
+                        try:
+                            log_order_attempt(
+                                symbol=test_symbol,
+                                side="sell",
+                                qty=1,
+                                price=None,
+                                sentiment=None,
+                                order_id=str(getattr(order2, "id", "TEST_SELL")),
+                                status="submitted",
+                                reason="test_trade_sell",
+                            )
+                        except Exception:
+                            pass
+
+                        fill2 = wait_for_order_fill(
+                            broker=broker,
+                            order=order2,
+                            symbol=test_symbol,
+                            side="sell",
+                            fallback_price=None,
+                        )
+                        if not fill2:
+                            broker_fallback_sell(
+                                broker=broker,
+                                symbol=test_symbol,
+                                pre_qty=1,
+                                sentiment=0.0,
+                                reason="TEST_TRADE",
+                                price_hint=None,
+                            )
+                        else:
+                            log_trade(
+                                symbol=test_symbol,
+                                side="sell",
+                                qty=int(fill2["qty"]),
+                                price=float(fill2["price"]),
+                                sentiment=0.0,
+                                order_id=str(fill2["order_id"] or "TEST_SELL"),
+                            )
+
+                mark_test_trade_ran()
+            except Exception as e:
+                logger.error(f"Test trade failed: {e}")
 
     # ----- SENTIMENT STACK -----
     sentiment_model = FinBertSentimentModel()
@@ -426,6 +993,13 @@ def main():
     max_symbols = int(settings.max_symbols_per_run)
     if max_symbols > 0:
         symbols = symbols[:max_symbols]
+    held_symbols = {
+        str(getattr(p, "symbol", "")).upper()
+        for p in positions
+        if getattr(p, "symbol", "")
+    }
+    symbols = sorted(set(symbols) | held_symbols)
+    symbols = filter_symbols_by_quality(symbols, protected_symbols=held_symbols)
     price_indicators = build_price_indicators(symbols, api_key, secret_key)
     tp_pct = float(settings.take_profit_pct)
     sl_pct = float(settings.stop_loss_pct)
@@ -545,35 +1119,76 @@ def main():
         if current_qty > 0 and symbol in entry_times:
             held_for = datetime.utcnow() - entry_times[symbol]
             if held_for >= MAX_HOLD_TIME:
-                 print(f"[red]TIME EXIT → SELL {current_qty} {symbol}[/red]")
+                print(f"[red]TIME EXIT → SELL {current_qty} {symbol}[/red]")
 
-            if read_only:
-                logger.info(f"READ-ONLY — would TIME EXIT sell {current_qty} {symbol}")
-                time.sleep(2)
+                if read_only:
+                    logger.info(f"READ-ONLY — would TIME EXIT sell {current_qty} {symbol}")
+                    time.sleep(2)
+                    continue
+
+                pre_qty = current_qty
+                pre_qty = current_qty
+                order = broker.place_market_order(symbol, "sell", current_qty)
+                try:
+                    log_order_attempt(
+                        symbol=symbol,
+                        side="sell",
+                        qty=current_qty,
+                        price=None,
+                        sentiment=sentiment_score,
+                        order_id=str(getattr(order, "id", "TIME_EXIT")),
+                        status="submitted",
+                        reason="time_exit",
+                    )
+                except Exception:
+                    pass
+
+                exit_price = get_last_price_safe(broker, symbol, "time_exit")
+                fill = wait_for_order_fill(
+                    broker=broker,
+                    order=order,
+                    symbol=symbol,
+                    side="sell",
+                    fallback_price=exit_price,
+                )
+                if not fill:
+                    sold_qty = broker_fallback_sell(
+                        broker=broker,
+                        symbol=symbol,
+                        pre_qty=pre_qty,
+                        sentiment=sentiment_score,
+                        reason="TIME_EXIT",
+                        price_hint=exit_price,
+                    )
+                    if sold_qty <= 0:
+                        time.sleep(2)
+                        continue
+                    exit_price = float(exit_price or 0.0)
+                    fill = {
+                        "qty": sold_qty,
+                        "price": exit_price,
+                        "order_id": "BROKER_FALLBACK_TIME_EXIT",
+                    }
+                exit_price = float(fill["price"])
+                log_trade(
+                    symbol=symbol,
+                    side="sell",
+                    qty=int(fill["qty"]),
+                    price=exit_price,
+                    sentiment=sentiment_score,
+                    order_id=str(fill["order_id"] or "TIME_EXIT"),
+                )
+
+                last_trade_time[symbol] = datetime.utcnow()
+                cooldowns[symbol] = datetime.utcnow()
+                save_cooldowns(cooldowns)
+
+                # 🔄 reset state
+                sentiment_streak[symbol] = {"buy": 0, "sell": 0}
+                entry_times.pop(symbol, None)
+                save_streaks(sentiment_streak)
+
                 continue
-
-            order = broker.place_market_order(symbol, "sell", current_qty)
-            last_trade_time[symbol] = datetime.utcnow()
-            cooldowns[symbol] = datetime.utcnow()
-
-            exit_price = get_last_price_safe(broker, symbol, "time_exit")
-            if exit_price is None:
-                exit_price = 0.0
-            log_trade(
-                symbol=symbol,
-                side="sell",
-                qty=current_qty,
-                price=exit_price,
-                sentiment=sentiment_score,
-                order_id=str(getattr(order, "id", "TIME_EXIT")),
-        )
-
-        # 🔄 reset state
-            sentiment_streak[symbol] = {"buy": 0, "sell": 0}
-            entry_times.pop(symbol, None)
-            save_streaks(sentiment_streak)
-
-            continue
 
         # ----------------------------------
         # EXIT FIRST (NO FLIPS)
@@ -588,58 +1203,210 @@ def main():
                     time.sleep(2)
                     continue
 
+                pre_qty = current_qty
                 order = broker.place_market_order(symbol, "sell", current_qty)
+                try:
+                    log_order_attempt(
+                        symbol=symbol,
+                        side="sell",
+                        qty=current_qty,
+                        price=None,
+                        sentiment=sentiment_score,
+                        order_id=str(getattr(order, "id", "EXIT")),
+                        status="submitted",
+                        reason="signal_exit",
+                    )
+                except Exception:
+                    pass
+
+                # 🔁 RESET SENTIMENT BIAS (PHASE 3.1)
+                sentiment_streak[symbol] = {"buy": 0, "sell": 0}
+                save_streaks(sentiment_streak)
+
+                exit_price = get_last_price_safe(broker, symbol, "exit")
+                fill = wait_for_order_fill(
+                    broker=broker,
+                    order=order,
+                    symbol=symbol,
+                    side="sell",
+                    fallback_price=exit_price,
+                )
+                if not fill:
+                    sold_qty = broker_fallback_sell(
+                        broker=broker,
+                        symbol=symbol,
+                        pre_qty=pre_qty,
+                        sentiment=sentiment_score,
+                        reason="SIGNAL_EXIT",
+                        price_hint=exit_price,
+                    )
+                    if sold_qty <= 0:
+                        time.sleep(2)
+                        continue
+                    exit_price = float(exit_price or 0.0)
+                    fill = {
+                        "qty": sold_qty,
+                        "price": exit_price,
+                        "order_id": "BROKER_FALLBACK_SIGNAL_EXIT",
+                    }
+                exit_price = float(fill["price"])
+                save_block_reason(symbol, "ELIGIBLE")
+
+                log_trade(
+                    symbol=symbol,
+                    side="sell",
+                    qty=int(fill["qty"]),
+                    price=exit_price,
+                    sentiment=sentiment_score,
+                    order_id=str(fill["order_id"] or "EXIT"),
+                )
 
                 exit_time = datetime.utcnow()
                 last_trade_time[symbol] = exit_time
                 cooldowns[symbol] = exit_time
                 save_cooldowns(cooldowns)
 
-
-        # 🔁 RESET SENTIMENT BIAS (PHASE 3.1)
-                sentiment_streak[symbol] = {"buy": 0, "sell": 0}
-                save_streaks(sentiment_streak)
-
-                exit_price = get_last_price_safe(broker, symbol, "exit")
-                if exit_price is None:
-                    exit_price = 0.0
-                save_block_reason(symbol, "ELIGIBLE")
-
-                log_trade(
-                   symbol=symbol,
-                   side="sell",
-                   qty=current_qty,
-                   price=exit_price,
-                   sentiment=sentiment_score,
-                   order_id=str(getattr(order, "id", "EXIT")),
-        )
-
                 send_email(
-                   subject=f"📉 Trade Executed: {symbol} SELL",
-                   body=(
-                      f"Symbol: {symbol}\n"
-                      f"Side: SELL\n"
-                      f"Qty: {current_qty}\n"
-                      f"Price: ${exit_price:.2f}\n"
-                      f"Sentiment: {sentiment_score:.3f}\n"
-                      f"Order ID: {getattr(order, 'id', 'EXIT')}"
-                      ),
-                     settings=settings,
-                     )
+                    subject=f"📉 Trade Executed: {symbol} SELL",
+                    body=(
+                        f"Symbol: {symbol}\n"
+                        f"Side: SELL\n"
+                        f"Qty: {int(fill['qty'])}\n"
+                        f"Price: ${exit_price:.2f}\n"
+                        f"Sentiment: {sentiment_score:.3f}\n"
+                        f"Order ID: {getattr(order, 'id', 'EXIT')}"
+                    ),
+                    settings=settings,
+                )
 
                 state["trades_today"] += 1
 
                 print(f"[red]SELL submitted[/red]: {getattr(order, 'id', 'EXIT')}")
                 logger.info(
-                       f"TRADE symbol={symbol} side=sell qty={current_qty} "
-                       f"sentiment={sentiment_score:.3f} price~{exit_price:.2f}"
-                         )
+                    f"TRADE symbol={symbol} side=sell qty={int(fill['qty'])} "
+                    f"sentiment={sentiment_score:.3f} price~{exit_price:.2f}"
+                )
             else:
                 print("No position to sell — skipping")
 
             continue
 
-        
+        # 🎯 TAKE-PROFIT / STOP-LOSS / TRAILING STOP EXIT
+        if current_qty > 0:
+            last_px = get_last_price_safe(broker, symbol, "tp_sl_check")
+            try:
+                avg_entry = float(getattr(broker.get_position(symbol), "avg_entry_price", 0.0))
+            except Exception:
+                avg_entry = 0.0
+
+            if last_px is not None and avg_entry > 0:
+                change_pct = (last_px - avg_entry) / avg_entry
+                trailing_hit = False
+                if trailing_enabled:
+                    peak = peak_prices.get(symbol, last_px)
+                    if last_px <= peak * (1 - trailing_pct):
+                        trailing_hit = True
+
+                if change_pct >= tp_pct:
+                    reason = "TAKE_PROFIT"
+                    print(f"[green]TAKE PROFIT → SELL {current_qty} {symbol}[/green]")
+                elif change_pct <= -sl_pct:
+                    reason = "STOP_LOSS"
+                    print(f"[red]STOP LOSS → SELL {current_qty} {symbol}[/red]")
+                elif trailing_hit:
+                    reason = "TRAILING_STOP"
+                    print(f"[red]TRAILING STOP → SELL {current_qty} {symbol}[/red]")
+                else:
+                    reason = ""
+
+                if reason:
+                    if read_only:
+                        logger.info(f"READ-ONLY — would {reason} sell {current_qty} {symbol}")
+                        time.sleep(2)
+                        continue
+
+                    pre_qty = current_qty
+                    order = broker.place_market_order(symbol, "sell", current_qty)
+                    try:
+                        log_order_attempt(
+                            symbol=symbol,
+                            side="sell",
+                            qty=current_qty,
+                            price=None,
+                            sentiment=sentiment_score,
+                            order_id=str(getattr(order, "id", "TP_SL")),
+                            status="submitted",
+                            reason=reason.lower(),
+                        )
+                    except Exception:
+                        pass
+
+                    exit_price = get_last_price_safe(broker, symbol, "tp_sl_exit")
+                    fill = wait_for_order_fill(
+                        broker=broker,
+                        order=order,
+                        symbol=symbol,
+                        side="sell",
+                        fallback_price=exit_price if exit_price is not None else float(last_px),
+                    )
+                    if not fill:
+                        sold_qty = broker_fallback_sell(
+                            broker=broker,
+                            symbol=symbol,
+                            pre_qty=pre_qty,
+                            sentiment=sentiment_score,
+                            reason=reason,
+                            price_hint=exit_price if exit_price is not None else float(last_px),
+                        )
+                        if sold_qty <= 0:
+                            time.sleep(2)
+                            continue
+                        exit_price = float((exit_price if exit_price is not None else float(last_px)) or 0.0)
+                        fill = {
+                            "qty": sold_qty,
+                            "price": exit_price,
+                            "order_id": f"BROKER_FALLBACK_{reason}",
+                        }
+                    exit_price = float(fill["price"])
+                    log_trade(
+                        symbol=symbol,
+                        side="sell",
+                        qty=int(fill["qty"]),
+                        price=exit_price,
+                        sentiment=sentiment_score,
+                        order_id=str(fill["order_id"] or "TP_SL"),
+                    )
+
+                    last_trade_time[symbol] = datetime.utcnow()
+                    cooldowns[symbol] = datetime.utcnow()
+                    save_cooldowns(cooldowns)
+
+                    send_email(
+                        subject=f"📉 Trade Executed: {symbol} SELL",
+                        body=(
+                            f"Symbol: {symbol}\n"
+                            f"Side: SELL\n"
+                            f"Qty: {int(fill['qty'])}\n"
+                            f"Price: ${exit_price:.2f}\n"
+                            f"Reason: {reason}\n"
+                            f"Order ID: {fill['order_id'] or getattr(order, 'id', 'TP_SL')}"
+                        ),
+                        settings=settings,
+                    )
+
+                    state["trades_today"] += 1
+                    print(f"[red]SELL submitted[/red]: {getattr(order, 'id', 'TP_SL')}")
+                    logger.info(
+                        f"TRADE symbol={symbol} side=sell qty={int(fill['qty'])} "
+                        f"price~{exit_price:.2f} reason={reason.lower()}"
+                    )
+
+                    sentiment_streak[symbol] = {"buy": 0, "sell": 0}
+                    save_streaks(sentiment_streak)
+                    entry_times.pop(symbol, None)
+                    peak_prices.pop(symbol, None)
+                    continue
+
         # ----------------------------------
         # HOLD
         # ----------------------------------
@@ -733,26 +1500,50 @@ def main():
                 continue
 
             order = broker.place_market_order(symbol, "buy", qty)
-            last_trade_time[symbol] = datetime.utcnow()
+            try:
+                log_order_attempt(
+                    symbol=symbol,
+                    side="buy",
+                    qty=qty,
+                    price=price,
+                    sentiment=sentiment_score,
+                    order_id=str(getattr(order, "id", "ENTRY")),
+                    status="submitted",
+                    reason="signal_entry",
+                )
+            except Exception:
+                pass
             save_block_reason(symbol, "Eligible")
+            fill = wait_for_order_fill(
+                broker=broker,
+                order=order,
+                symbol=symbol,
+                side="buy",
+                fallback_price=price,
+            )
+            if not fill:
+                time.sleep(2)
+                continue
             log_trade(
                 symbol=symbol,
                 side="buy",
-                qty=qty,
-                price=price,
+                qty=int(fill["qty"]),
+                price=float(fill["price"]),
                 sentiment=sentiment_score,
-                order_id=str(getattr(order, "id", "ENTRY")),
+                order_id=str(fill["order_id"] or "ENTRY"),
             )
+
+            last_trade_time[symbol] = datetime.utcnow()
 
             send_email(
                 subject=f"📈 Trade Executed: {symbol} BUY",
                 body=(
                     f"Symbol: {symbol}\n"
                     f"Side: BUY\n"
-                    f"Qty: {qty}\n"
-                    f"Price: ${price:.2f}\n"
+                    f"Qty: {int(fill['qty'])}\n"
+                    f"Price: ${float(fill['price']):.2f}\n"
                     f"Sentiment: {sentiment_score:.3f}\n"
-                    f"Order ID: {getattr(order, 'id', 'ENTRY')}"
+                    f"Order ID: {fill['order_id'] or getattr(order, 'id', 'ENTRY')}"
                 ),
                 settings=settings,
             )
@@ -761,8 +1552,8 @@ def main():
 
             print(f"[green]BUY submitted[/green]: {getattr(order, 'id', 'ENTRY')}")
             logger.info(
-                f"TRADE symbol={symbol} side=buy qty={qty} "
-                f"sentiment={sentiment_score:.3f} price~{price:.2f}"
+                f"TRADE symbol={symbol} side=buy qty={int(fill['qty'])} "
+                f"sentiment={sentiment_score:.3f} price~{float(fill['price']):.2f}"
             )
 
             if scale_in:
@@ -772,83 +1563,6 @@ def main():
 
             time.sleep(2)
             continue
-
-        # 🎯 TAKE-PROFIT / STOP-LOSS / TRAILING STOP EXIT
-        if current_qty > 0:
-            last_px = get_last_price_safe(broker, symbol, "tp_sl_check")
-            try:
-                avg_entry = float(getattr(broker.get_position(symbol), "avg_entry_price", 0.0))
-            except Exception:
-                avg_entry = 0.0
-
-            if last_px is not None and avg_entry > 0:
-                change_pct = (last_px - avg_entry) / avg_entry
-                trailing_hit = False
-                if trailing_enabled:
-                    peak = peak_prices.get(symbol, last_px)
-                    if last_px <= peak * (1 - trailing_pct):
-                        trailing_hit = True
-
-                if change_pct >= tp_pct:
-                    reason = "TAKE_PROFIT"
-                    print(f"[green]TAKE PROFIT → SELL {current_qty} {symbol}[/green]")
-                elif change_pct <= -sl_pct:
-                    reason = "STOP_LOSS"
-                    print(f"[red]STOP LOSS → SELL {current_qty} {symbol}[/red]")
-                elif trailing_hit:
-                    reason = "TRAILING_STOP"
-                    print(f"[red]TRAILING STOP → SELL {current_qty} {symbol}[/red]")
-                else:
-                    reason = ""
-
-                if reason:
-                    if read_only:
-                        logger.info(f"READ-ONLY — would {reason} sell {current_qty} {symbol}")
-                        time.sleep(2)
-                        continue
-
-                    order = broker.place_market_order(symbol, "sell", current_qty)
-                    last_trade_time[symbol] = datetime.utcnow()
-                    cooldowns[symbol] = datetime.utcnow()
-                    save_cooldowns(cooldowns)
-
-                    exit_price = get_last_price_safe(broker, symbol, "tp_sl_exit")
-                    if exit_price is None:
-                        exit_price = float(last_px)
-                    log_trade(
-                        symbol=symbol,
-                        side="sell",
-                        qty=current_qty,
-                        price=exit_price,
-                        sentiment=sentiment_score,
-                        order_id=str(getattr(order, "id", "TP_SL")),
-                    )
-
-                    send_email(
-                        subject=f"📉 Trade Executed: {symbol} SELL",
-                        body=(
-                            f"Symbol: {symbol}\n"
-                            f"Side: SELL\n"
-                            f"Qty: {current_qty}\n"
-                            f"Price: ${exit_price:.2f}\n"
-                            f"Reason: {reason}\n"
-                            f"Order ID: {getattr(order, 'id', 'TP_SL')}"
-                        ),
-                        settings=settings,
-                    )
-
-                    state["trades_today"] += 1
-                    print(f"[red]SELL submitted[/red]: {getattr(order, 'id', 'TP_SL')}")
-                    logger.info(
-                        f"TRADE symbol={symbol} side=sell qty={current_qty} "
-                        f"price~{exit_price:.2f} reason={reason.lower()}"
-                    )
-
-                    sentiment_streak[symbol] = {"buy": 0, "sell": 0}
-                    save_streaks(sentiment_streak)
-                    entry_times.pop(symbol, None)
-                    peak_prices.pop(symbol, None)
-                    continue
 
     # ----- DAILY SUMMARY EMAIL -----
     if settings.send_daily_summary_email:
