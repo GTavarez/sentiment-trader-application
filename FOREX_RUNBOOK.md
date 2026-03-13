@@ -67,7 +67,18 @@ FOREX_DB_PATH=data/forex_trader.db
 FOREX_HTTP_TIMEOUT_S=15
 FOREX_HTTP_RETRIES=3
 FOREX_HTTP_BACKOFF_S=1.5
+FOREX_ALERTS_ENABLED=true
+FOREX_ALERT_DRY_RUN=false
 ```
+
+### Failure Alerts
+- On bot failure (`STATUS=FAIL`), `run_forex_bot.bat` runs `forex_failure_alert.py`.
+- Uses existing email env vars:
+  - `EMAIL_FROM`
+  - `EMAIL_TO`
+  - `EMAIL_PASSWORD`
+  - optional: `SMTP_SERVER`, `SMTP_PORT`
+- Set `FOREX_ALERT_DRY_RUN=true` to test alert wiring without sending email.
 
 ### Strategy (Current)
 - Pulls latest and previous-business-day FX rates from Frankfurter API.

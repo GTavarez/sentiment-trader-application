@@ -21,5 +21,6 @@ if "%BOT_RC%"=="0" (
   echo FOREX RUN END %DATE% %TIME% STATUS=OK>> forex_output.log
 ) else (
   echo FOREX RUN END %DATE% %TIME% STATUS=FAIL RC=%BOT_RC%>> forex_output.log
+  "%PYTHON%" forex_failure_alert.py --rc %BOT_RC% >> forex_output.log 2>&1
 )
 exit /b %BOT_RC%
