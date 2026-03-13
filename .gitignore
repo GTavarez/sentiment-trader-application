@@ -5,3 +5,7 @@ __pycache__/
 TASK_RAN.txt
 .env
 data/*.db
+BAT_RAN.txt
+FOREX_BAT_RAN.txt
+data/heartbeat.txt
+data/block_reasons.json
