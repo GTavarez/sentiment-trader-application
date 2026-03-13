@@ -64,6 +64,9 @@ FOREX_MAX_HOLD_DAYS=3
 FOREX_READ_ONLY=false
 FOREX_API_BASE=https://api.frankfurter.app
 FOREX_DB_PATH=data/forex_trader.db
+FOREX_HTTP_TIMEOUT_S=15
+FOREX_HTTP_RETRIES=3
+FOREX_HTTP_BACKOFF_S=1.5
 ```
 
 ### Strategy (Current)

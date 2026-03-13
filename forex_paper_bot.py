@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import socket
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -40,6 +42,9 @@ class ForexSettings:
     read_only: bool = _bool_env("FOREX_READ_ONLY", False)
     api_base: str = os.getenv("FOREX_API_BASE", "https://api.frankfurter.app").strip()
     db_path: Path = Path(os.getenv("FOREX_DB_PATH", "data/forex_trader.db"))
+    http_timeout_s: float = _float_env("FOREX_HTTP_TIMEOUT_S", 15.0)
+    http_retries: int = _int_env("FOREX_HTTP_RETRIES", 3)
+    http_backoff_s: float = _float_env("FOREX_HTTP_BACKOFF_S", 1.5)
 
     def __post_init__(self) -> None:
         raw_pairs = os.getenv("FOREX_PAIRS", "USD/CAD,EUR/USD,GBP/USD,USD/JPY")
@@ -79,33 +84,52 @@ def ensure_db(path: Path) -> None:
     conn.close()
 
 
-def _http_json(url: str) -> dict:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json",
-        },
-    )
-    try:
-        with urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except HTTPError:
-        # Retry once with a simpler user-agent for stricter edge gateways.
-        req = Request(url, headers={"User-Agent": "python-forex-bot/1.0", "Accept": "application/json"})
-        with urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+def _http_json(url: str, timeout_s: float, retries: int, backoff_s: float) -> dict:
+    user_agents = [
+        (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "python-forex-bot/1.0",
+    ]
+    max_retries = max(1, int(retries))
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        for ua in user_agents:
+            req = Request(url, headers={"User-Agent": ua, "Accept": "application/json"})
+            try:
+                with urlopen(req, timeout=float(timeout_s)) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            except HTTPError as exc:
+                # 4xx (except 429) is usually not transient.
+                if 400 <= exc.code < 500 and exc.code != 429:
+                    raise
+                last_exc = exc
+            except (URLError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
+                last_exc = exc
+
+        if attempt < max_retries:
+            time.sleep(float(backoff_s) * attempt)
+
+    if last_exc is not None:
+        raise RuntimeError(f"request failed after {max_retries} attempts: {last_exc}") from last_exc
+    raise RuntimeError(f"request failed after {max_retries} attempts")
 
 
-def fetch_rate(api_base: str, pair: str, d: Optional[date] = None) -> tuple[str, float]:
+def fetch_rate(
+    api_base: str,
+    pair: str,
+    d: Optional[date] = None,
+    timeout_s: float = 15.0,
+    retries: int = 3,
+    backoff_s: float = 1.5,
+) -> tuple[str, float]:
     base, quote = pair.split("/")
     day_path = "latest" if d is None else d.isoformat()
     url = f"{api_base}/{day_path}?from={base}&to={quote}"
-    payload = _http_json(url)
+    payload = _http_json(url, timeout_s=timeout_s, retries=retries, backoff_s=backoff_s)
     rate = float(payload["rates"][quote])
     asof = str(payload["date"])
     return asof, rate
@@ -184,15 +208,33 @@ def run_once(settings: ForexSettings) -> None:
     print(f"Threshold: {settings.signal_threshold_pct:.4f}")
     print(f"Notional USD: {settings.notional_usd:.2f}")
     print(f"Read-only: {settings.read_only}")
+    print(f"HTTP timeout/retries/backoff: {settings.http_timeout_s:.1f}s/{settings.http_retries}/{settings.http_backoff_s:.1f}s")
     print("")
 
+    fetch_ok = 0
+    fetch_fail = 0
     try:
         for pair in settings.pairs:
             try:
-                asof_now, px_now = fetch_rate(settings.api_base, pair)
-                asof_prev, px_prev = fetch_rate(settings.api_base, pair, prev_day)
-            except (URLError, KeyError, ValueError) as e:
-                print(f"{pair}: data fetch failed ({e})")
+                asof_now, px_now = fetch_rate(
+                    settings.api_base,
+                    pair,
+                    timeout_s=settings.http_timeout_s,
+                    retries=settings.http_retries,
+                    backoff_s=settings.http_backoff_s,
+                )
+                asof_prev, px_prev = fetch_rate(
+                    settings.api_base,
+                    pair,
+                    prev_day,
+                    timeout_s=settings.http_timeout_s,
+                    retries=settings.http_retries,
+                    backoff_s=settings.http_backoff_s,
+                )
+                fetch_ok += 1
+            except Exception as e:
+                fetch_fail += 1
+                print(f"{pair}: data fetch failed ({type(e).__name__}: {e})")
                 continue
 
             change_pct = (px_now - px_prev) / px_prev if px_prev > 0 else 0.0
@@ -246,6 +288,10 @@ def run_once(settings: ForexSettings) -> None:
                 log_trade(conn, pair, exit_side, qty, px_now, reason, pnl)
                 print(f"  CLOSED {side} qty={qty:.4f} @ {px_now:.6f} pnl={pnl:.2f} ({reason})")
 
+        print("")
+        print(f"Run summary: fetch_ok={fetch_ok} fetch_fail={fetch_fail}")
+        if fetch_ok == 0:
+            raise RuntimeError(f"all {len(settings.pairs)} pairs failed to fetch; no decisions made")
         conn.commit()
     except Exception:
         conn.rollback()
