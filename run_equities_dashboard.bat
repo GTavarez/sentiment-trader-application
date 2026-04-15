@@ -7,11 +7,11 @@ REM ---- MOVE TO PROJECT ROOT ----
 cd /d C:\Users\gisif\Desktop\Trader
 
 REM ---- PROOF FILE ----
-echo COMPARE DASH BAT RAN AT %DATE% %TIME% > COMPARE_DASH_BAT_RAN.txt
+echo EQUITIES DASH BAT RAN AT %DATE% %TIME% > EQUITIES_DASH_BAT_RAN.txt
 
 REM ---- SYNC LATEST DATA FROM DESKTOP RUNNER ----
 call sync_from_desktop.bat
 
-REM ---- START COMPARISON DASHBOARD ON PORT 8503 ----
-start "" /b "%PYTHON%" -m streamlit run streamlit_compare_app.py --server.port 8503 --server.address 127.0.0.1 >> compare_dash_output.log 2>&1
+REM ---- START EQUITIES DASHBOARD ON PORT 8501 ----
+start "" /b "%PYTHON%" -m streamlit run streamlit_app.py --server.port 8501 --server.address 127.0.0.1 >> equities_dash_output.log 2>&1
 exit /b 0
